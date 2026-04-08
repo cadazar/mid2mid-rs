@@ -15,6 +15,9 @@ The collator should support:
 - NumPy array output (for JAX/Flax compatibility, no PyTorch dependency)
 - Vocabulary merging with a pre-trained text tokenizer so that text and
   MIDI tokens share a single unified vocabulary
+- Reuse of existing sentinel tokens from the text tokenizer (e.g.,
+  <extra_id_0>..<extra_id_255>) so that the model builds a unified
+  understanding of span corruption across modalities
 """
 
 from __future__ import annotations
@@ -85,7 +88,15 @@ class Mid2MidCollatorConfig:
     """Configuration for the Mid2Mid collator."""
 
     max_seq_len: int = 2048
-    num_sentinels: int = 100
+
+    # sentinel tokens are reused from the text tokenizer (e.g.,
+    # <extra_id_0>..<extra_id_255> in CRAFT/T5-style tokenizers).
+    # if sentinel_token_pattern is set, the collator will discover
+    # sentinel token IDs from the text tokenizer at init time rather
+    # than creating new ones. this ensures the model uses the same
+    # sentinel semantics for both text and MIDI span corruption.
+    sentinel_token_pattern: str = "<extra_id_{i}>"
+    max_sentinels: int = 256
 
     # corruption task weights: keys are task types from MIDI_TASK_PROMPTS,
     # values are sampling weights (will be normalized to sum to 1.0)
