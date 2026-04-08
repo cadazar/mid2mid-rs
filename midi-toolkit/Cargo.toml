@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "midi-core",
+    "midi-py"
+]
+resolver = "2"

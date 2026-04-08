@@ -1,0 +1,12 @@
+[package]
+name = "midi-py"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "midi_toolkit"
+crate-type = ["cdylib"]
+
+[dependencies]
+midi-core = { path = "../midi-core" }
+pyo3 = { version = "0.21.0", features = ["extension-module"] }
