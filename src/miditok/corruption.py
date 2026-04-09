@@ -2,8 +2,14 @@
 
 All functions take and return plain Python lists of integer token IDs and use
 NumPy as the only numeric dependency.  Sentinel tokens are assigned in
-*decreasing* order starting from ``sentinel_start_id`` (which corresponds to
-``<extra_id_0>``) so that they line up with T5 conventions.
+**increasing** order: first corrupted span → ``sentinel_token_ids[start_sentinel_idx]``,
+second → ``sentinel_token_ids[start_sentinel_idx + 1]``, etc.
+
+Every corruption strategy returns a 3-tuple::
+
+    (encoder_ids, decoder_ids, next_sentinel_idx)
+
+so that multiple corruption calls can be chained across segments.
 """
 
 from __future__ import annotations
@@ -28,17 +34,14 @@ def _random_segmentation(
     if num_segments == 1:
         return np.array([num_items], dtype=np.int64)
     if num_items < num_segments:
-        # Cannot make N non-empty segments from fewer items; clamp.
         out = np.ones(num_segments, dtype=np.int64)
         out[-1] += max(0, num_items - num_segments)
         return out
-    # Place segment boundaries.
     positions = np.arange(num_items - 1, dtype=np.int64)
     is_boundary = np.zeros(num_items - 1, dtype=bool)
     is_boundary[: num_segments - 1] = True
     rng.shuffle(is_boundary)
     boundary_indices = np.flatnonzero(is_boundary) + 1
-    # Compute lengths via differences of cumulative positions.
     starts = np.concatenate([[0], boundary_indices])
     ends = np.concatenate([boundary_indices, [num_items]])
     return ends - starts
@@ -50,7 +53,15 @@ def random_spans_noise_mask(
     mean_noise_span_length: float = 3.0,
     rng: np.random.Generator | None = None,
 ) -> np.ndarray:
-    """Generate a boolean noise mask following the T5 random span scheme."""
+    """Generate a boolean noise mask following the T5 random span scheme.
+
+    Algorithm:
+    1. ``num_noise_tokens = round(length * noise_density)``, clamped to ``[1, length-1]``
+    2. ``num_noise_spans = max(1, round(num_noise_tokens / mean_noise_span_length))``
+    3. Randomly segment both noise and non-noise tokens into ``num_noise_spans`` parts
+    4. Interleave starting with non-noise: ``[nonnoise_0, noise_0, nonnoise_1, noise_1, ...]``
+    5. Odd-indexed spans are noise
+    """
     if rng is None:
         rng = np.random.default_rng()
     if length <= 1 or noise_density <= 0.0:
@@ -66,12 +77,9 @@ def random_spans_noise_mask(
     noise_lengths = _random_segmentation(num_noise_tokens, num_noise_spans, rng)
     nonnoise_lengths = _random_segmentation(num_nonnoise_tokens, num_noise_spans, rng)
 
-    # Interleave: nonnoise_0, noise_0, nonnoise_1, noise_1, ...
     interleaved = np.empty(2 * num_noise_spans, dtype=np.int64)
     interleaved[0::2] = nonnoise_lengths
     interleaved[1::2] = noise_lengths
-    span_starts = np.cumsum(interleaved)
-    # Build the mask: positions in odd-indexed spans are noise.
     mask = np.zeros(length, dtype=bool)
     cursor = 0
     for i, span_len in enumerate(interleaved):
@@ -84,36 +92,64 @@ def random_spans_noise_mask(
 def noise_span_to_unique_sentinel(
     token_ids: Sequence[int],
     noise_mask: np.ndarray,
-    sentinel_start_id: int,
-) -> list[int]:
-    """Replace each noise span with a unique decreasing sentinel token."""
+    sentinel_token_ids: list[int],
+    start_sentinel_idx: int = 0,
+) -> tuple[list[int], int]:
+    """Replace each noise span with an increasing sentinel token.
+
+    Returns ``(compressed_ids, next_sentinel_idx)``.
+    """
     arr = np.asarray(token_ids, dtype=np.int64)
     mask = np.asarray(noise_mask, dtype=bool)
     if arr.size == 0:
-        return []
+        return [], start_sentinel_idx
     prev_mask = np.concatenate([[False], mask[:-1]])
     span_starts = mask & ~prev_mask
     out: list[int] = []
-    sentinel_idx = 0
+    sentinel_idx = start_sentinel_idx
     for i in range(arr.size):
         if span_starts[i]:
-            out.append(sentinel_start_id - sentinel_idx)
+            out.append(sentinel_token_ids[sentinel_idx])
             sentinel_idx += 1
         elif mask[i]:
             continue
         else:
             out.append(int(arr[i]))
-    return out
+    return out, sentinel_idx
 
 
 def nonnoise_span_to_unique_sentinel(
     token_ids: Sequence[int],
     noise_mask: np.ndarray,
-    sentinel_start_id: int,
-) -> list[int]:
-    """Same as ``noise_span_to_unique_sentinel`` but with the inverted mask."""
+    sentinel_token_ids: list[int],
+    start_sentinel_idx: int = 0,
+) -> tuple[list[int], int]:
+    """Same as ``noise_span_to_unique_sentinel`` but with the inverted mask.
+
+    Used to build decoder targets.
+    """
     inv = ~np.asarray(noise_mask, dtype=bool)
-    return noise_span_to_unique_sentinel(token_ids, inv, sentinel_start_id)
+    return noise_span_to_unique_sentinel(token_ids, inv, sentinel_token_ids, start_sentinel_idx)
+
+
+def apply_span_corruption(
+    token_ids: Sequence[int],
+    noise_density: float,
+    mean_span_length: float,
+    sentinel_token_ids: list[int],
+    start_sentinel_idx: int = 0,
+    rng: np.random.Generator | None = None,
+) -> tuple[list[int], list[int], int]:
+    """Convenience: mask + encoder/decoder sentinel replacement.
+
+    Returns ``(encoder_ids, decoder_ids, next_sentinel_idx)``.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    mask = random_spans_noise_mask(len(token_ids), noise_density, mean_span_length, rng=rng)
+    enc, next_idx = noise_span_to_unique_sentinel(token_ids, mask, sentinel_token_ids, start_sentinel_idx)
+    dec, _ = nonnoise_span_to_unique_sentinel(token_ids, mask, sentinel_token_ids, start_sentinel_idx)
+    return enc, dec, next_idx
 
 
 # ---------------------------------------------------------------------------
@@ -163,12 +199,7 @@ def _ensure_rng(rng: np.random.Generator | None) -> np.random.Generator:
 def _align_mask_to_boundaries(
     mask: np.ndarray, boundaries: list[int], length: int,
 ) -> np.ndarray:
-    """Snap each contiguous noise span to the nearest boundary positions.
-
-    ``boundaries`` are token indices considered span-start anchors.  The result
-    has the same number of True positions as the input mask, but each span now
-    starts at a boundary token (or the original index if no boundary is near).
-    """
+    """Snap each contiguous noise span to the nearest boundary positions."""
     if not boundaries:
         return mask
     bset = sorted(set(boundaries))
@@ -182,7 +213,6 @@ def _align_mask_to_boundaries(
             span_start = i
         elif (not mask[i]) and in_span:
             in_span = False
-            # snap [span_start, i) to nearest boundary
             idx = int(np.searchsorted(barr, span_start))
             anchor = bset[idx] if idx < len(bset) else bset[-1]
             anchor = max(0, min(length - 1, anchor))
@@ -199,11 +229,13 @@ def _align_mask_to_boundaries(
 def beat_denoising(
     token_ids: Sequence[int],
     vocab: Mapping[str, int],
+    sentinel_token_ids: list[int],
     noise_density: float = 0.15,
     mean_noise_span_length: float = 2.0,
-    sentinel_start_id: int = 0,
+    start_sentinel_idx: int = 0,
     rng: np.random.Generator | None = None,
-) -> tuple[list[int], list[int]]:
+) -> tuple[list[int], list[int], int]:
+    """Mask spans aligned to beat positions."""
     rng = _ensure_rng(rng)
     structure = analyze_midi_structure(token_ids, vocab)
     raw_mask = random_spans_noise_mask(
@@ -213,72 +245,83 @@ def beat_denoising(
         raw_mask, structure["beat_indices"] or structure["timing_indices"],
         len(token_ids),
     )
-    enc = noise_span_to_unique_sentinel(token_ids, aligned, sentinel_start_id)
-    dec = nonnoise_span_to_unique_sentinel(token_ids, aligned, sentinel_start_id)
-    return enc, dec
+    enc, next_idx = noise_span_to_unique_sentinel(token_ids, aligned, sentinel_token_ids, start_sentinel_idx)
+    dec, _ = nonnoise_span_to_unique_sentinel(token_ids, aligned, sentinel_token_ids, start_sentinel_idx)
+    return enc, dec, next_idx
 
 
 def measure_denoising(
     token_ids: Sequence[int],
     vocab: Mapping[str, int],
+    sentinel_token_ids: list[int],
     noise_density: float = 0.30,
     mean_noise_span_length: float = 2.0,
-    sentinel_start_id: int = 0,
+    start_sentinel_idx: int = 0,
     rng: np.random.Generator | None = None,
-) -> tuple[list[int], list[int]]:
+) -> tuple[list[int], list[int], int]:
+    """Mask spans aligned to bar boundaries."""
     rng = _ensure_rng(rng)
     structure = analyze_midi_structure(token_ids, vocab)
     raw_mask = random_spans_noise_mask(
         len(token_ids), noise_density, mean_noise_span_length, rng=rng,
     )
     aligned = _align_mask_to_boundaries(raw_mask, structure["bar_indices"], len(token_ids))
-    enc = noise_span_to_unique_sentinel(token_ids, aligned, sentinel_start_id)
-    dec = nonnoise_span_to_unique_sentinel(token_ids, aligned, sentinel_start_id)
-    return enc, dec
+    enc, next_idx = noise_span_to_unique_sentinel(token_ids, aligned, sentinel_token_ids, start_sentinel_idx)
+    dec, _ = nonnoise_span_to_unique_sentinel(token_ids, aligned, sentinel_token_ids, start_sentinel_idx)
+    return enc, dec, next_idx
 
 
 def note_denoising(
     token_ids: Sequence[int],
-    vocab: Mapping[str, int],  # noqa: ARG001
+    vocab: Mapping[str, int],
+    sentinel_token_ids: list[int],
     noise_density: float = 0.15,
     mean_noise_span_length: float = 3.0,
-    sentinel_start_id: int = 0,
+    start_sentinel_idx: int = 0,
     rng: np.random.Generator | None = None,
-) -> tuple[list[int], list[int]]:
+) -> tuple[list[int], list[int], int]:
+    """Standard T5 span corruption on MIDI tokens."""
     rng = _ensure_rng(rng)
     mask = random_spans_noise_mask(
         len(token_ids), noise_density, mean_noise_span_length, rng=rng,
     )
-    enc = noise_span_to_unique_sentinel(token_ids, mask, sentinel_start_id)
-    dec = nonnoise_span_to_unique_sentinel(token_ids, mask, sentinel_start_id)
-    return enc, dec
+    enc, next_idx = noise_span_to_unique_sentinel(token_ids, mask, sentinel_token_ids, start_sentinel_idx)
+    dec, _ = nonnoise_span_to_unique_sentinel(token_ids, mask, sentinel_token_ids, start_sentinel_idx)
+    return enc, dec, next_idx
 
 
 def heavy_denoising(
     token_ids: Sequence[int],
-    vocab: Mapping[str, int],  # noqa: ARG001
+    vocab: Mapping[str, int],
+    sentinel_token_ids: list[int],
     noise_density: float = 0.50,
     mean_noise_span_length: float = 8.0,
-    sentinel_start_id: int = 0,
+    start_sentinel_idx: int = 0,
     rng: np.random.Generator | None = None,
-) -> tuple[list[int], list[int]]:
+) -> tuple[list[int], list[int], int]:
+    """Heavy corruption: 50% density with long spans."""
     rng = _ensure_rng(rng)
     mask = random_spans_noise_mask(
         len(token_ids), noise_density, mean_noise_span_length, rng=rng,
     )
-    enc = noise_span_to_unique_sentinel(token_ids, mask, sentinel_start_id)
-    dec = nonnoise_span_to_unique_sentinel(token_ids, mask, sentinel_start_id)
-    return enc, dec
+    enc, next_idx = noise_span_to_unique_sentinel(token_ids, mask, sentinel_token_ids, start_sentinel_idx)
+    dec, _ = nonnoise_span_to_unique_sentinel(token_ids, mask, sentinel_token_ids, start_sentinel_idx)
+    return enc, dec, next_idx
 
 
 def attribute_denoising(
     token_ids: Sequence[int],
     vocab: Mapping[str, int],
+    sentinel_token_ids: list[int],
     corruption_ratio: float = 0.20,
-    sentinel_start_id: int = 0,  # noqa: ARG001
+    start_sentinel_idx: int = 0,
     rng: np.random.Generator | None = None,
-) -> tuple[list[int], list[int]]:
-    """Replace velocity/duration tokens with random alternates of the same kind."""
+) -> tuple[list[int], list[int], int]:
+    """Replace velocity/duration/pitch tokens with random alternates of the same kind.
+
+    No sentinels are used — returns corrupted as encoder, original as decoder,
+    and ``next_sentinel_idx`` unchanged.
+    """
     rng = _ensure_rng(rng)
     inv = {int(v): k for k, v in vocab.items()}
     by_prefix: dict[str, list[int]] = {}
@@ -302,25 +345,58 @@ def attribute_denoising(
             options = by_prefix[prefix]
             new_id = int(rng.choice(options))
             encoder_ids[i] = new_id
-    return encoder_ids, decoder_ids
+    return encoder_ids, decoder_ids, start_sentinel_idx
 
 
 def continuation(
     token_ids: Sequence[int],
     vocab: Mapping[str, int],
+    sentinel_token_ids: list[int] | None = None,
     prefix_ratio_range: tuple[float, float] = (0.2, 0.5),
+    start_sentinel_idx: int = 0,
     rng: np.random.Generator | None = None,
-    sentinel_start_id: int = 0,  # noqa: ARG001
-) -> tuple[list[int], list[int]]:
+) -> tuple[list[int], list[int], int]:
+    """Split into prefix/continuation.
+
+    Randomly chooses split granularity: bar boundary, beat boundary, or
+    arbitrary token position.  No sentinels are used.
+
+    Returns ``(prefix_ids, continuation_ids, next_sentinel_idx_unchanged)``.
+    The returned dict-compatible metadata about the split (prefix_measures, etc.)
+    is computed by the caller from the structure analysis.
+    """
     rng = _ensure_rng(rng)
     structure = analyze_midi_structure(token_ids, vocab)
     bars = structure["bar_indices"]
+    beats = structure["beat_indices"] or structure["timing_indices"]
     n = len(token_ids)
-    if not bars or n < 4:
-        cut = max(1, int(round(n * (prefix_ratio_range[0] + prefix_ratio_range[1]) / 2)))
-        return list(token_ids[:cut]), list(token_ids[cut:])
+    if n < 4:
+        cut = max(1, n // 2)
+        return list(token_ids[:cut]), list(token_ids[cut:]), start_sentinel_idx
+
     lo = max(1, int(round(n * prefix_ratio_range[0])))
     hi = max(lo + 1, int(round(n * prefix_ratio_range[1])))
-    eligible = [b for b in bars if lo <= b <= hi]
-    cut = int(rng.choice(eligible)) if eligible else int(bars[len(bars) // 2])
-    return list(token_ids[:cut]), list(token_ids[cut:])
+
+    # Choose split granularity: 0=bar, 1=beat, 2=arbitrary
+    granularity = int(rng.integers(0, 3))
+
+    if granularity == 0 and bars:
+        eligible = [b for b in bars if lo <= b <= hi]
+        if eligible:
+            cut = int(rng.choice(eligible))
+            return list(token_ids[:cut]), list(token_ids[cut:]), start_sentinel_idx
+    if granularity <= 1 and beats:
+        eligible = [b for b in beats if lo <= b <= hi]
+        if eligible:
+            cut = int(rng.choice(eligible))
+            return list(token_ids[:cut]), list(token_ids[cut:]), start_sentinel_idx
+
+    # Fallback: bar boundary if available, else arbitrary
+    if bars:
+        eligible = [b for b in bars if lo <= b <= hi]
+        if eligible:
+            cut = int(rng.choice(eligible))
+            return list(token_ids[:cut]), list(token_ids[cut:]), start_sentinel_idx
+
+    cut = int(rng.integers(lo, min(hi, n)))
+    return list(token_ids[:cut]), list(token_ids[cut:]), start_sentinel_idx

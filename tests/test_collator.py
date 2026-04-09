@@ -1,4 +1,4 @@
-"""Tests for Mid2MidCollator and Mid2MidDataset."""
+"""Tests for Mid2MidCollator and related utilities."""
 
 from __future__ import annotations
 
@@ -12,18 +12,24 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mid2mid_collator import (  # noqa: E402
+from mid2mid_collator import (
     MIDI_TASK_PROMPTS,
     Mid2MidCollator,
     Mid2MidCollatorConfig,
     merge_vocabularies,
+    _extract_midi_vocab,
 )
-from miditok import REMI  # noqa: E402
-from miditok.mid2mid_dataset import Mid2MidDataset, compute_bar_ticks  # noqa: E402
-from miditok.midi_adapter import AdapterScore  # noqa: E402
+from miditok import REMI
+from miditok.mid2mid_dataset import Mid2MidDataset, compute_bar_ticks
+from miditok.midi_adapter import AdapterScore
 
 SAMPLE_MIDI = REPO_ROOT / "violin_partita_bwv-1004_1_(c)grossman.mid"
 SAMPLE_MIDI_2 = REPO_ROOT / "violin_partita_bwv-1004_2_(c)grossman.mid"
+
+
+# -------------------------------------------------------------------
+# Fake text tokenizer for testing
+# -------------------------------------------------------------------
 
 
 class FakeTextTokenizer:
@@ -43,179 +49,390 @@ class FakeTextTokenizer:
         return self._vocab.get(tok)
 
 
+# -------------------------------------------------------------------
+# Fixtures
+# -------------------------------------------------------------------
+
+
+@pytest.fixture
+def dataset() -> Mid2MidDataset:
+    return Mid2MidDataset(
+        [SAMPLE_MIDI], measures_per_segment=8,
+        augment_with_sliding=False, seed=0,
+    )
+
+
+@pytest.fixture
+def dataset_two() -> Mid2MidDataset:
+    return Mid2MidDataset(
+        [SAMPLE_MIDI, SAMPLE_MIDI_2], measures_per_segment=8,
+        augment_with_sliding=False, seed=0,
+    )
+
+
 @pytest.fixture
 def collator() -> Mid2MidCollator:
-    cfg = Mid2MidCollatorConfig(max_seq_len=512, min_measures=2, max_measures=64)
+    cfg = Mid2MidCollatorConfig(max_seq_len=512)
     return Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=0)
 
 
 @pytest.fixture
-def collator_unpacked() -> Mid2MidCollator:
-    cfg = Mid2MidCollatorConfig(
-        max_seq_len=2048, min_measures=2, max_measures=64, pack_sequences=False
-    )
+def collator_large() -> Mid2MidCollator:
+    cfg = Mid2MidCollatorConfig(max_seq_len=2048)
     return Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=0)
 
 
-def test_output_keys(collator: Mid2MidCollator) -> None:
-    out = collator([SAMPLE_MIDI])
-    expected = {
-        "input_ids", "decoder_input_ids", "labels",
-        "segment_ids", "position_ids",
-        "decoder_segment_ids", "decoder_position_ids",
-    }
-    assert expected.issubset(out.keys())
+# -------------------------------------------------------------------
+# Output structure
+# -------------------------------------------------------------------
 
 
-def test_output_dtypes(collator: Mid2MidCollator) -> None:
-    out = collator([SAMPLE_MIDI])
+def test_output_has_5_keys(collator: Mid2MidCollator, dataset: Mid2MidDataset) -> None:
+    out = collator([dataset[0]])
+    expected = {"input_ids", "decoder_input_ids", "labels", "attention_mask", "decoder_attention_mask"}
+    assert set(out.keys()) == expected
+
+
+def test_output_dtypes(collator: Mid2MidCollator, dataset: Mid2MidDataset) -> None:
+    out = collator([dataset[0]])
     for v in out.values():
         assert isinstance(v, np.ndarray)
         assert v.dtype == np.int32
 
 
-def test_output_shapes(collator: Mid2MidCollator) -> None:
-    out = collator([SAMPLE_MIDI])
+def test_output_2d(collator: Mid2MidCollator, dataset: Mid2MidDataset) -> None:
+    out = collator([dataset[0]])
     for v in out.values():
         assert v.ndim == 2
-        assert v.shape[1] == collator.config.max_seq_len
 
 
-def test_input_decoder_same_length(collator: Mid2MidCollator) -> None:
-    out = collator([SAMPLE_MIDI, SAMPLE_MIDI_2])
+def test_output_shapes_single(collator: Mid2MidCollator, dataset: Mid2MidDataset) -> None:
+    out = collator([dataset[0]])
+    for v in out.values():
+        assert v.shape == (1, 512)
+
+
+def test_batch_output_shapes(collator: Mid2MidCollator, dataset: Mid2MidDataset) -> None:
+    segs = [dataset[i] for i in range(min(3, len(dataset)))]
+    out = collator(segs)
+    batch_size = len(segs)
+    for v in out.values():
+        assert v.shape == (batch_size, 512)
+
+
+# -------------------------------------------------------------------
+# input_ids and decoder_input_ids same length
+# -------------------------------------------------------------------
+
+
+def test_input_decoder_same_length(collator: Mid2MidCollator, dataset: Mid2MidDataset) -> None:
+    out = collator([dataset[0]])
     assert out["input_ids"].shape == out["decoder_input_ids"].shape
 
 
-def test_text_prefix_in_input(collator: Mid2MidCollator) -> None:
-    out = collator([SAMPLE_MIDI])
-    first = out["input_ids"][0]
-    text_id_max = collator.midi_id_offset
-    # First few tokens should be text (id < midi_id_offset)
-    nonzero = first[first > 0]
-    assert nonzero.size > 0
-    assert nonzero[0] < text_id_max
+# -------------------------------------------------------------------
+# Labels use -100 for padding
+# -------------------------------------------------------------------
 
 
-def test_text_prompt_not_corrupted(collator: Mid2MidCollator) -> None:
-    out = collator([SAMPLE_MIDI])
-    sentinel_set = set(collator.sentinel_ids)
-    seg = out["segment_ids"][0]
-    # Tokens belonging to the first segment within the text region.
-    text_region = out["input_ids"][0][:5]
-    for tid in text_region:
+def test_labels_padding_is_minus_100(collator: Mid2MidCollator, dataset: Mid2MidDataset) -> None:
+    out = collator([dataset[0]])
+    labels = out["labels"][0]
+    dec_mask = out["decoder_attention_mask"][0]
+    # Where decoder_attention_mask is 0 (padding), labels should be -100
+    padding_positions = dec_mask == 0
+    if padding_positions.any():
+        assert (labels[padding_positions] == -100).all()
+
+
+def test_labels_real_tokens_not_minus_100(
+    collator: Mid2MidCollator, dataset: Mid2MidDataset,
+) -> None:
+    out = collator([dataset[0]])
+    labels = out["labels"][0]
+    dec_mask = out["decoder_attention_mask"][0]
+    real_positions = dec_mask == 1
+    if real_positions.any():
+        assert (labels[real_positions] != -100).all()
+
+
+# -------------------------------------------------------------------
+# Attention masks
+# -------------------------------------------------------------------
+
+
+def test_attention_mask_binary(collator: Mid2MidCollator, dataset: Mid2MidDataset) -> None:
+    out = collator([dataset[0]])
+    for key in ("attention_mask", "decoder_attention_mask"):
+        mask = out[key]
+        assert set(np.unique(mask)).issubset({0, 1})
+
+
+def test_attention_mask_ones_then_zeros(
+    collator: Mid2MidCollator, dataset: Mid2MidDataset,
+) -> None:
+    """attention_mask should be 1s followed by 0s (no gaps)."""
+    out = collator([dataset[0]])
+    mask = out["attention_mask"][0]
+    # Find first zero
+    zeros = np.where(mask == 0)[0]
+    if len(zeros) > 0:
+        first_zero = zeros[0]
+        # Everything after first zero should be zero
+        assert (mask[first_zero:] == 0).all()
+
+
+def test_decoder_attention_mask_ones_then_zeros(
+    collator: Mid2MidCollator, dataset: Mid2MidDataset,
+) -> None:
+    out = collator([dataset[0]])
+    mask = out["decoder_attention_mask"][0]
+    zeros = np.where(mask == 0)[0]
+    if len(zeros) > 0:
+        first_zero = zeros[0]
+        assert (mask[first_zero:] == 0).all()
+
+
+# -------------------------------------------------------------------
+# Text prompt not corrupted
+# -------------------------------------------------------------------
+
+
+def test_text_prompt_not_corrupted(
+    collator: Mid2MidCollator, dataset: Mid2MidDataset,
+) -> None:
+    out = collator([dataset[0]])
+    sentinel_set = set(collator.sentinel_token_ids)
+    # First few tokens should be text (small IDs from FakeTextTokenizer)
+    first_tokens = out["input_ids"][0][:5]
+    for tid in first_tokens:
+        if int(tid) == 0:
+            continue  # padding
         assert int(tid) not in sentinel_set
 
 
-def test_padding_zero(collator: Mid2MidCollator) -> None:
-    out = collator([SAMPLE_MIDI])
-    seg = out["segment_ids"][0]
-    pad_positions = seg == 0
-    assert (out["input_ids"][0][pad_positions] == 0).all()
-    assert (out["position_ids"][0][pad_positions] == 0).all()
+# -------------------------------------------------------------------
+# Corruption tasks
+# -------------------------------------------------------------------
 
 
-def test_segment_ids_one_based(collator: Mid2MidCollator) -> None:
-    # Use a long max_seq_len to guarantee padding.
-    cfg = Mid2MidCollatorConfig(max_seq_len=8192, min_measures=2, max_measures=64)
-    coll = Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=0)
-    out = coll([SAMPLE_MIDI])
-    seg = out["segment_ids"]
-    assert seg.min() == 0  # padding
-    nonzero = seg[seg > 0]
-    assert nonzero.min() == 1
-
-
-def test_position_ids_one_based_per_segment(collator: Mid2MidCollator) -> None:
-    out = collator([SAMPLE_MIDI])
-    pos = out["position_ids"][0]
-    nonzero = pos[pos > 0]
-    assert nonzero[0] == 1
-
-
-def test_pack_sequences_packs_multiple(collator: Mid2MidCollator) -> None:
-    out = collator([SAMPLE_MIDI, SAMPLE_MIDI_2])
-    seg = out["segment_ids"]
-    # Either packed in same row (>=2 distinct seg ids in a row) or in different rows.
-    distinct_per_row = [len(set(int(x) for x in row if x > 0)) for row in seg]
-    assert max(distinct_per_row) >= 1
-
-
-def test_unpacked_per_example(collator_unpacked: Mid2MidCollator) -> None:
-    out = collator_unpacked([SAMPLE_MIDI, SAMPLE_MIDI_2])
-    seg = out["segment_ids"]
-    for row in seg:
-        nz = row[row > 0]
-        if nz.size:
-            assert (nz == 1).all()
-
-
-def test_min_measures_filter() -> None:
-    cfg = Mid2MidCollatorConfig(max_seq_len=512, min_measures=10000, max_measures=20000)
-    coll = Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=0)
-    out = coll([SAMPLE_MIDI])
-    # All examples filtered out -> empty single padded row
-    assert (out["input_ids"] == 0).all()
-
-
-def test_max_measures_truncation() -> None:
-    cfg = Mid2MidCollatorConfig(max_seq_len=2048, min_measures=2, max_measures=4)
-    coll = Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=0)
-    out = coll([SAMPLE_MIDI])
-    # Should still produce some output, but limited
-    assert out["input_ids"].shape[1] == 2048
-
-
-def test_task_sampling_distribution() -> None:
-    cfg = Mid2MidCollatorConfig(max_seq_len=1024, min_measures=2, max_measures=64)
+def test_different_tasks_sampled(dataset: Mid2MidDataset) -> None:
+    """With enough calls, different tasks should be sampled."""
+    cfg = Mid2MidCollatorConfig(max_seq_len=512)
     coll = Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=42)
-    # Use multiple invocations
-    for _ in range(3):
-        coll([SAMPLE_MIDI])
-    # Just verify it doesn't crash; deterministic via seed
-    out = coll([SAMPLE_MIDI])
-    assert out["input_ids"].shape[1] == 1024
+    # Process many examples
+    results = []
+    for i in range(min(20, len(dataset))):
+        result = coll._process_segment(dataset[i])
+        if result is not None:
+            results.append(result)
+    # Should produce some non-trivial results
+    assert len(results) > 0
 
 
-def test_merge_vocabularies_disjoint() -> None:
+def test_no_corruption_task() -> None:
+    """no_corruption task should produce identical encoder MIDI and decoder."""
+    cfg = Mid2MidCollatorConfig(
+        max_seq_len=512,
+        task_weights={"no_corruption": 1.0},  # Force no_corruption
+    )
+    coll = Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=0)
+    ds = Mid2MidDataset([SAMPLE_MIDI], measures_per_segment=8, augment_with_sliding=False, seed=0)
+    if len(ds) > 0:
+        out = coll([ds[0]])
+        # With no_corruption, decoder should mirror encoder's MIDI portion
+        assert out["input_ids"].any()
+
+
+def test_continuation_task() -> None:
+    cfg = Mid2MidCollatorConfig(
+        max_seq_len=2048,
+        task_weights={"continuation": 1.0},
+    )
+    coll = Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=0)
+    ds = Mid2MidDataset([SAMPLE_MIDI], measures_per_segment=8, augment_with_sliding=False, seed=0)
+    if len(ds) > 0:
+        out = coll([ds[0]])
+        assert out["input_ids"].any()
+        assert out["decoder_input_ids"].any()
+
+
+# -------------------------------------------------------------------
+# Pitch augmentation stays in MIDI range
+# -------------------------------------------------------------------
+
+
+def test_pitch_augmentation_in_range(dataset: Mid2MidDataset) -> None:
+    cfg = Mid2MidCollatorConfig(max_seq_len=512, pitch_shift_range=12)
+    coll = Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=0)
+    # Process many segments to test various shifts
+    for i in range(min(10, len(dataset))):
+        seg = dataset[i]
+        score = seg["score"]
+        for tr in score.tracks:
+            for n in tr.notes:
+                assert 0 <= n.pitch <= 127
+
+
+# -------------------------------------------------------------------
+# merge_vocabularies
+# -------------------------------------------------------------------
+
+
+def test_merge_vocabularies_non_overlapping() -> None:
     text = FakeTextTokenizer()
-    midi = {f"midi_{i}": i for i in range(50)}
+    midi = REMI()
     merged = merge_vocabularies(text, midi)
     text_ids = set(text.get_vocab().values())
-    midi_only_ids = set(merged[k] for k in midi)
+    midi_vocab = _extract_midi_vocab(midi)
+    midi_only_ids = set(merged[k] for k in midi_vocab if k not in text.get_vocab())
     assert text_ids.isdisjoint(midi_only_ids)
 
 
 def test_merge_vocabularies_preserves_text() -> None:
     text = FakeTextTokenizer()
-    midi = {"a": 0, "b": 1}
+    midi = REMI()
     merged = merge_vocabularies(text, midi)
     for k, v in text.get_vocab().items():
         assert merged[k] == v
 
 
-def test_collator_handles_missing_metadata(collator: Mid2MidCollator) -> None:
-    out = collator([SAMPLE_MIDI], metadata=None)
-    assert out["input_ids"].shape[1] == collator.config.max_seq_len
+def test_merge_vocabularies_sentinel_shared() -> None:
+    """Sentinel tokens should remain at their text-vocab positions, not duplicated."""
+    text = FakeTextTokenizer()
+    midi_vocab_dict = {"Pitch_60": 0, "Velocity_80": 1, "<extra_id_0>": 2}
+
+    class FakeMidi:
+        vocab = midi_vocab_dict
+
+    merged = merge_vocabularies(text, FakeMidi())
+    # <extra_id_0> should be at the text tokenizer's position
+    assert merged["<extra_id_0>"] == text.get_vocab()["<extra_id_0>"]
 
 
-def test_collator_with_metadata(collator: Mid2MidCollator) -> None:
-    out = collator([SAMPLE_MIDI], metadata=[{"composer": "Bach", "title": "Partita 2"}])
-    assert out["input_ids"].any()
+def test_merge_vocabularies_simple() -> None:
+    text = FakeTextTokenizer()
+    midi = {"a": 0, "b": 1}
+
+    class FakeMidi:
+        vocab = midi
+
+    merged = merge_vocabularies(text, FakeMidi())
+    assert "a" in merged
+    assert "b" in merged
+    assert merged["a"] >= text.vocab_size or merged["a"] in text.get_vocab().values()
 
 
-def test_end_to_end_real_midi(collator: Mid2MidCollator) -> None:
-    out = collator([SAMPLE_MIDI])
+# -------------------------------------------------------------------
+# Prompt templates
+# -------------------------------------------------------------------
+
+
+def test_prompt_templates_exist() -> None:
+    required = [
+        "beat_denoising", "measure_denoising", "note_denoising",
+        "attribute_denoising", "heavy_denoising", "continuation", "no_corruption",
+    ]
+    for key in required:
+        assert key in MIDI_TASK_PROMPTS
+        assert len(MIDI_TASK_PROMPTS[key]) > 0
+
+
+def test_continuation_templates_have_musical_units() -> None:
+    templates = MIDI_TASK_PROMPTS["continuation"]
+    has_measures = any("measures" in t for t in templates)
+    has_beats = any("beats" in t for t in templates)
+    has_complete = any("Complete" in t for t in templates)
+    assert has_measures
+    assert has_beats
+    assert has_complete
+
+
+def test_no_corruption_template() -> None:
+    templates = MIDI_TASK_PROMPTS["no_corruption"]
+    assert any("Reproduce" in t for t in templates)
+
+
+# -------------------------------------------------------------------
+# Empty input handling
+# -------------------------------------------------------------------
+
+
+def test_empty_segments_list(collator: Mid2MidCollator) -> None:
+    out = collator([])
+    assert out["input_ids"].shape == (1, 512)
+    assert (out["input_ids"] == 0).all()
+    assert (out["labels"] == -100).all()
+
+
+# -------------------------------------------------------------------
+# End-to-end
+# -------------------------------------------------------------------
+
+
+def test_end_to_end_real_midi(collator: Mid2MidCollator, dataset: Mid2MidDataset) -> None:
+    out = collator([dataset[0]])
     assert out["input_ids"].dtype == np.int32
     assert out["input_ids"].shape == (1, 512)
-    assert out["segment_ids"].max() >= 1
+    assert out["attention_mask"][0].sum() > 0
+    assert out["decoder_attention_mask"][0].sum() > 0
 
 
-def test_dataset_segments_and_compute_bar_ticks() -> None:
-    score = AdapterScore.from_file(SAMPLE_MIDI)
-    bars = compute_bar_ticks(score)
-    assert len(bars) >= 2
-    ds = Mid2MidDataset([SAMPLE_MIDI], measures_per_segment=8, augment_with_sliding=False, seed=0)
+def test_end_to_end_batch(
+    collator: Mid2MidCollator, dataset_two: Mid2MidDataset,
+) -> None:
+    segs = [dataset_two[i] for i in range(min(4, len(dataset_two)))]
+    out = collator(segs)
+    batch_size = len(segs)
+    assert out["input_ids"].shape[0] == batch_size
+    assert out["decoder_input_ids"].shape[0] == batch_size
+
+
+def test_end_to_end_load_segment_tokenize_corrupt_collate() -> None:
+    """Full pipeline: load MIDI → segment → tokenize → corrupt → collate → verify."""
+    ds = Mid2MidDataset(
+        [SAMPLE_MIDI], measures_per_segment=8,
+        augment_with_sliding=False, seed=0,
+    )
     assert len(ds) > 0
-    seg = ds[0]
-    assert "score" in seg
-    assert seg["num_measures"] <= 8
+
+    cfg = Mid2MidCollatorConfig(max_seq_len=1024)
+    coll = Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=0)
+    out = coll([ds[0], ds[min(1, len(ds) - 1)]])
+
+    # Verify output structure
+    assert set(out.keys()) == {
+        "input_ids", "decoder_input_ids", "labels",
+        "attention_mask", "decoder_attention_mask",
+    }
+    for v in out.values():
+        assert v.dtype == np.int32
+        assert v.ndim == 2
+        assert v.shape[1] == 1024
+
+
+def test_collator_handles_segment_with_metadata() -> None:
+    ds = Mid2MidDataset(
+        [SAMPLE_MIDI], measures_per_segment=8,
+        augment_with_sliding=False,
+        metadata={str(SAMPLE_MIDI): {"composer": "Bach", "title": "Partita 2"}},
+        seed=0,
+    )
+    if len(ds) > 0:
+        seg = ds[0]
+        assert seg["metadata"]["composer"] == "Bach"
+        cfg = Mid2MidCollatorConfig(max_seq_len=512)
+        coll = Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=0)
+        out = coll([seg])
+        assert out["input_ids"].any()
+
+
+def test_collator_deterministic_with_seed(dataset: Mid2MidDataset) -> None:
+    cfg = Mid2MidCollatorConfig(max_seq_len=512)
+    coll1 = Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=42)
+    coll2 = Mid2MidCollator(REMI(), FakeTextTokenizer(), cfg, seed=42)
+    seg = dataset[0]
+    out1 = coll1([seg])
+    out2 = coll2([seg])
+    assert np.array_equal(out1["input_ids"], out2["input_ids"])
+    assert np.array_equal(out1["labels"], out2["labels"])

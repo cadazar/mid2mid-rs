@@ -1,85 +1,87 @@
-"""Stub interface for the Mid2Mid collator.
+"""Instruction-conditioned collator for Mid2Mid pre-training.
 
-This module defines the expected API for a multimodal text+MIDI collator
-that produces encoder/decoder pairs for sequence-to-sequence pre-training.
+Produces **unpacked** per-example dicts with 5 keys matching the CRAFT
+training interface.  The CRAFT packing layer (``pack_documents``) handles
+segment_ids / position_ids separately.
 
-The collator should support:
-- Instruction-conditioned corruption with natural language task prompts
-  that describe the specific type of corruption applied (beat-level,
-  measure-level, note-level, track-level, attribute-level), teaching the
-  model musical concepts through language
-- Sentinel-based span corruption (T5-style, not BERT <mask>)
-- Mixed text+MIDI sequences where the encoder sees a natural language
-  prompt describing the corruption and score metadata, followed by
-  corrupted MIDI tokens, and the decoder sees the original MIDI sequence
-- NumPy array output (for JAX/Flax compatibility, no PyTorch dependency)
-- Vocabulary merging with a pre-trained text tokenizer so that text and
-  MIDI tokens share a single unified vocabulary
-- Reuse of existing sentinel tokens from the text tokenizer (e.g.,
-  <extra_id_0>..<extra_id_255>) so that the model builds a unified
-  understanding of span corruption across modalities
+Output per example::
+
+    {
+        "input_ids":              np.array(int32, (max_seq_len,)),
+        "decoder_input_ids":      np.array(int32, (max_seq_len,)),
+        "labels":                 np.array(int32, (max_seq_len,)),
+        "attention_mask":         np.array(int32, (max_seq_len,)),
+        "decoder_attention_mask": np.array(int32, (max_seq_len,)),
+    }
+
+Batch output stacks along axis 0 → ``(batch_size, max_seq_len)``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from miditok import corruption as _corruption
+from miditok.corruption import analyze_midi_structure
 from miditok.midi_adapter import AdapterScore
 
+# ---------------------------------------------------------------------------
+# Prompt templates
+# ---------------------------------------------------------------------------
 
-# corruption task types and their corresponding prompt templates.
-# each corruption type maps to a list of prompt variants that describe
-# what was done to the sequence, so the model learns musical concepts
-# through natural language conditioning from the start of training.
-MIDI_TASK_PROMPTS = {
-    'beat_denoising': [
+MIDI_TASK_PROMPTS: dict[str, list[str]] = {
+    "beat_denoising": [
         "Several beats have been removed from this MIDI sequence. "
-        "The original piece is {metadata}. Restore the missing beats:",
+        "The original piece is {metadata}. Restore the missing beats: ",
         "Beats have been dropped from the following MIDI excerpt. "
-        "This is {metadata}. Reconstruct them:",
+        "This is {metadata}. Reconstruct them: ",
     ],
-    'measure_denoising': [
+    "measure_denoising": [
         "Multiple measures have been removed from this MIDI sequence. "
-        "The original piece is {metadata}. Restore them:",
+        "The original piece is {metadata}. Restore them: ",
         "The following MIDI excerpt of {metadata} has had entire measures "
-        "deleted. Reconstruct the missing measures:",
+        "deleted. Reconstruct the missing measures: ",
     ],
-    'note_denoising': [
+    "note_denoising": [
         "Individual notes have been randomly removed from this MIDI "
-        "sequence. The original piece is {metadata}. Restore them:",
+        "sequence. The original piece is {metadata}. Restore them: ",
         "Some notes are missing from this MIDI excerpt of {metadata}. "
-        "Fill in the gaps:",
+        "Fill in the gaps: ",
     ],
-    'attribute_denoising': [
+    "attribute_denoising": [
         "The velocity values in this MIDI sequence have been corrupted. "
-        "The original piece is {metadata}. Restore the original dynamics:",
+        "The original piece is {metadata}. Restore the original dynamics: ",
         "Note durations have been altered in this MIDI excerpt of "
-        "{metadata}. Restore them to their original values:",
+        "{metadata}. Restore them to their original values: ",
         "Pitch values have been shifted randomly in parts of this MIDI "
-        "sequence. The original piece is {metadata}. Correct them:",
+        "sequence. The original piece is {metadata}. Correct them: ",
     ],
-    'track_denoising': [
-        "Tracks have been incorrectly merged in this MIDI sequence. "
-        "The original piece is {metadata}. Separate and restore them:",
-        "Instrument assignments have been scrambled in this MIDI excerpt "
-        "of {metadata}. Restore the correct program assignments:",
-    ],
-    'heavy_denoising': [
+    "heavy_denoising": [
         "This MIDI sequence has been heavily corrupted with large sections "
-        "removed. The original piece is {metadata}. Reconstruct it:",
+        "removed. The original piece is {metadata}. Reconstruct it: ",
         "Most of the following MIDI excerpt of {metadata} has been "
-        "destroyed. Restore it as completely as possible:",
+        "destroyed. Restore it as completely as possible: ",
     ],
-    'continuation': [
-        "Continue the following MIDI sequence. The piece is {metadata}:",
-        "Write a continuation for this MIDI excerpt of {metadata}:",
-        "Complete the following MIDI passage from {metadata}:",
+    "continuation": [
+        "Here are {prefix_measures} measures of {metadata}. "
+        "Continue for {continuation_measures} measures: ",
+        "The following {prefix_beats} beats are from {metadata}. "
+        "Continue for {continuation_beats} beats: ",
+        "Complete this piece to the end. The piece is {metadata}: ",
+    ],
+    "no_corruption": [
+        "The following MIDI sequence is from {metadata}. "
+        "Reproduce it exactly: ",
     ],
 }
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -87,101 +89,103 @@ class Mid2MidCollatorConfig:
     """Configuration for the Mid2Mid collator."""
 
     max_seq_len: int = 2048
+    pad_token_id: int = 0
+    label_ignore_id: int = -100  # for padding positions in labels
 
-    # sentinel tokens are reused from the text tokenizer (e.g.,
-    # <extra_id_0>..<extra_id_255> in CRAFT/T5-style tokenizers).
-    # if sentinel_token_pattern is set, the collator will discover
-    # sentinel token IDs from the text tokenizer at init time rather
-    # than creating new ones. this ensures the model uses the same
-    # sentinel semantics for both text and MIDI span corruption.
-    sentinel_token_pattern: str = "<extra_id_{i}>"
-    max_sentinels: int = 256
-
-    # corruption task weights: keys are task types from MIDI_TASK_PROMPTS,
-    # values are sampling weights (will be normalized to sum to 1.0)
+    # Corruption task weights (normalized to sum to 1.0)
     task_weights: dict[str, float] = field(default_factory=lambda: {
-        'beat_denoising': 0.15,
-        'measure_denoising': 0.15,
-        'note_denoising': 0.15,
-        'attribute_denoising': 0.10,
-        'track_denoising': 0.05,
-        'heavy_denoising': 0.20,
-        'continuation': 0.20,
+        "beat_denoising": 0.15,
+        "measure_denoising": 0.15,
+        "note_denoising": 0.15,
+        "attribute_denoising": 0.10,
+        "heavy_denoising": 0.20,
+        "continuation": 0.20,
+        "no_corruption": 0.05,
     })
 
-    # corruption intensity per task type
-    corruption_params: dict[str, dict] = field(default_factory=lambda: {
-        'beat_denoising': {
-            'mask_ratio': 0.15,
-            'mean_span_beats': 2.0,
-            'unit': 'beat',
-        },
-        'measure_denoising': {
-            'mask_ratio': 0.30,
-            'mean_span_measures': 2.0,
-            'unit': 'measure',
-        },
-        'note_denoising': {
-            'mask_ratio': 0.15,
-            'mean_span_notes': 3.0,
-            'unit': 'note',
-        },
-        'attribute_denoising': {
-            'corruption_ratio': 0.20,
-            'attributes': ['velocity', 'duration', 'pitch'],
-            'unit': 'attribute',
-        },
-        'track_denoising': {
-            'merge_probability': 0.5,
-            'unit': 'track',
-        },
-        'heavy_denoising': {
-            'mask_ratio': 0.50,
-            'mean_span_measures': 4.0,
-            'unit': 'measure',
-        },
-        'continuation': {
-            'prefix_ratio_range': (0.2, 0.5),
-            'unit': 'sequence',
-        },
-    })
-
-    # augmentation
+    # Augmentation
     pitch_shift_range: int = 6
     tempo_stretch_range: tuple[float, float] = (0.8, 1.2)
 
-    # measure filtering
-    min_measures: int = 4
-    max_measures: int = 64
 
-    # batch packing
-    pack_sequences: bool = True
-    pad_token_id: int = 0
+# ---------------------------------------------------------------------------
+# Vocabulary merging
+# ---------------------------------------------------------------------------
 
 
-def merge_vocabularies(text_tokenizer, midi_vocab: dict[str, int]) -> dict[str, int]:
-    """Append MIDI tokens after the text tokenizer's vocabulary."""
-    base_size = int(text_tokenizer.vocab_size)
-    combined: dict[str, int] = {}
-    text_vocab = text_tokenizer.get_vocab() if hasattr(text_tokenizer, "get_vocab") else {}
-    combined.update(text_vocab)
+def merge_vocabularies(
+    text_tokenizer: Any,
+    midi_tokenizer: Any,
+) -> dict[str, int]:
+    """Append MIDI tokens after the text tokenizer's vocabulary.
+
+    Sentinel tokens remain at their existing positions (shared across text
+    and MIDI).
+    """
+    base_size = int(getattr(text_tokenizer, "vocab_size", 0))
+
+    # Get text vocab
+    if hasattr(text_tokenizer, "get_vocab"):
+        text_vocab: dict[str, int] = dict(text_tokenizer.get_vocab())
+    else:
+        text_vocab = {}
+
+    combined: dict[str, int] = dict(text_vocab)
     next_id = max(combined.values(), default=-1) + 1
     next_id = max(next_id, base_size)
-    for tok, _ in sorted(midi_vocab.items(), key=lambda kv: kv[1]):
+
+    # Get MIDI vocab
+    midi_vocab = _extract_midi_vocab(midi_tokenizer)
+
+    # Identify sentinel tokens (they should stay at their text-vocab positions)
+    sentinel_tokens = {k for k in text_vocab if k.startswith("<extra_id_")}
+
+    for tok in sorted(midi_vocab.keys()):
         if tok in combined:
+            continue
+        if tok in sentinel_tokens:
             continue
         combined[tok] = next_id
         next_id += 1
+
     return combined
 
 
+def _extract_midi_vocab(midi_tokenizer: Any) -> dict[str, int]:
+    """Extract a flat vocab dict from a midi tokenizer."""
+    vocab = getattr(midi_tokenizer, "vocab", None)
+    if vocab is None:
+        vocab = getattr(midi_tokenizer, "_unified_vocab", {})
+    if isinstance(vocab, dict):
+        return dict(vocab)
+    if isinstance(vocab, list) and vocab and isinstance(vocab[0], dict):
+        out: dict[str, int] = {}
+        offset = 0
+        for sub in vocab:
+            for k, v in sub.items():
+                if k not in out:
+                    out[k] = v + offset
+            offset += len(sub)
+        return out
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Collator
+# ---------------------------------------------------------------------------
+
+
 class Mid2MidCollator:
-    """Concrete instruction-conditioned collator for MIDI pre-training."""
+    """Instruction-conditioned collator for MIDI seq2seq pre-training.
+
+    Takes segment dicts (from :class:`Mid2MidDataset`) and produces batched
+    NumPy int32 arrays.
+    """
 
     def __init__(
         self,
-        midi_tokenizer,
-        text_tokenizer,
+        midi_tokenizer: Any,
+        text_tokenizer: Any,
         config: Mid2MidCollatorConfig,
         seed: int | None = None,
     ) -> None:
@@ -191,37 +195,18 @@ class Mid2MidCollator:
         self._rng = np.random.default_rng(seed)
         self._py_random = __import__("random").Random(seed)
 
-        # Build merged vocab so MIDI tokens have unique IDs offset from text.
-        midi_vocab = self._extract_midi_vocab(midi_tokenizer)
-        self.combined_vocab = merge_vocabularies(text_tokenizer, midi_vocab)
+        # Build merged vocab
+        self.combined_vocab = merge_vocabularies(text_tokenizer, midi_tokenizer)
         self.midi_id_offset = int(getattr(text_tokenizer, "vocab_size", 0))
-        # Discover sentinel ids in the text vocab.
-        self.sentinel_ids = self._discover_sentinels()
-        self.sentinel_start_id = self.sentinel_ids[0] if self.sentinel_ids else (
-            self.midi_id_offset + len(midi_vocab) + 100
-        )
 
-    @staticmethod
-    def _extract_midi_vocab(midi_tokenizer) -> dict[str, int]:
-        vocab = getattr(midi_tokenizer, "vocab", None)
-        if isinstance(vocab, dict):
-            return dict(vocab)
-        if isinstance(vocab, list) and vocab and isinstance(vocab[0], dict):
-            out: dict[str, int] = {}
-            offset = 0
-            for sub in vocab:
-                for k, v in sub.items():
-                    if k not in out:
-                        out[k] = v + offset
-                offset += len(sub)
-            return out
-        return {}
+        # Discover sentinel token IDs from text tokenizer
+        self.sentinel_token_ids = self._discover_sentinels()
 
-    def _discover_sentinels(self) -> list[int]:
+    def _discover_sentinels(self, max_sentinels: int = 4096) -> list[int]:
+        """Find sentinel token IDs in the text tokenizer, ordered by index."""
         out: list[int] = []
-        pattern = self.config.sentinel_token_pattern
-        for i in range(self.config.max_sentinels):
-            tok = pattern.format(i=i)
+        for i in range(max_sentinels):
+            tok = f"<extra_id_{i}>"
             if hasattr(self.text_tokenizer, "convert_tokens_to_ids"):
                 tid = self.text_tokenizer.convert_tokens_to_ids(tok)
                 if tid is not None and tid != getattr(self.text_tokenizer, "unk_token_id", None):
@@ -230,37 +215,40 @@ class Mid2MidCollator:
             voc = self.combined_vocab
             if tok in voc:
                 out.append(int(voc[tok]))
+            else:
+                break
         return out
 
-    def _midi_id_to_global(self, mid_id: int) -> int:
-        return mid_id + self.midi_id_offset
+    # ------------------------------------------------------------------
+    # Per-example pipeline
+    # ------------------------------------------------------------------
 
-    def _process_single(
-        self,
-        path: Path,
-        metadata: dict | None,
-    ) -> tuple[list[int], list[int]] | None:
-        try:
-            score = AdapterScore.from_file(str(path))
-        except Exception:
-            return None
-        # Augmentation: pitch shift
+    def _process_segment(self, segment: dict[str, Any]) -> dict[str, np.ndarray] | None:
+        """Process a single segment dict into a training example."""
+        score: AdapterScore = segment["score"].copy()
+        metadata = segment.get("metadata", {})
+
+        # 1. Augmentation: pitch shift
         if self.config.pitch_shift_range > 0:
-            shift = int(self._rng.integers(-self.config.pitch_shift_range, self.config.pitch_shift_range + 1))
+            shift = int(self._rng.integers(
+                -self.config.pitch_shift_range,
+                self.config.pitch_shift_range + 1,
+            ))
             if shift != 0:
                 for tr in score.tracks:
                     if tr.is_drum:
                         continue
                     for n in tr.notes:
                         n.pitch = max(0, min(127, n.pitch + shift))
-        # Tempo stretch
+
+        # Augmentation: tempo stretch
         lo, hi = self.config.tempo_stretch_range
         if hi > lo:
             stretch = float(self._rng.uniform(lo, hi))
             for tempo in score.tempos:
                 tempo.tempo = float(tempo.tempo * stretch)
 
-        # Tokenize
+        # 2. Tokenize
         try:
             tokseq = self.midi_tokenizer.encode(score)
         except Exception:
@@ -271,67 +259,189 @@ class Mid2MidCollator:
             seq = tokseq[0]
         else:
             seq = tokseq
-        ids = list(seq.ids) if hasattr(seq, "ids") and seq.ids else []
-        tokens = list(seq.tokens) if hasattr(seq, "tokens") else []
-        if not ids or not tokens:
+        midi_ids = list(seq.ids) if hasattr(seq, "ids") and seq.ids else []
+        midi_tokens = list(seq.tokens) if hasattr(seq, "tokens") else []
+        if not midi_ids:
             return None
 
-        # Bar-token filtering
-        bar_positions = [i for i, t in enumerate(tokens) if t.startswith("Bar")]
-        if len(bar_positions) < self.config.min_measures:
-            return None
-        if len(bar_positions) > self.config.max_measures:
-            cut_pos = bar_positions[self.config.max_measures]
-            ids = ids[:cut_pos]
-            tokens = tokens[:cut_pos]
+        # 3. Get format sentinel token (if universal tokenizer)
+        format_sentinel_id = None
+        if hasattr(self.midi_tokenizer, "format_sentinel"):
+            # Universal tokenizer — pick format from the sequence context
+            fmt_sentinels = self.midi_tokenizer.format_sentinel
+            fmt = getattr(seq, "_format", None)
+            if fmt and fmt in fmt_sentinels:
+                sentinel_tok = fmt_sentinels[fmt]
+                vocab = getattr(self.midi_tokenizer, "vocab", {})
+                if isinstance(vocab, dict):
+                    format_sentinel_id = vocab.get(sentinel_tok)
 
-        midi_vocab = self._extract_midi_vocab(self.midi_tokenizer)
+        # 4. Get MIDI vocab for structure analysis
+        midi_vocab = _extract_midi_vocab(self.midi_tokenizer)
 
-        # Sample task
+        # 5. Sample corruption task
         keys = list(self.config.task_weights.keys())
         weights = np.array([self.config.task_weights[k] for k in keys], dtype=np.float64)
         weights /= weights.sum()
         task = str(self._rng.choice(keys, p=weights))
 
-        # Apply corruption
-        sentinel_start = self.sentinel_start_id
-        rng = self._rng
+        # 6. Apply corruption
         if task == "beat_denoising":
-            enc_mid, dec_mid = _corruption.beat_denoising(ids, midi_vocab, sentinel_start_id=sentinel_start, rng=rng)
+            enc_mid, dec_mid, _ = _corruption.beat_denoising(
+                midi_ids, midi_vocab, self.sentinel_token_ids, rng=self._rng)
         elif task == "measure_denoising":
-            enc_mid, dec_mid = _corruption.measure_denoising(ids, midi_vocab, sentinel_start_id=sentinel_start, rng=rng)
+            enc_mid, dec_mid, _ = _corruption.measure_denoising(
+                midi_ids, midi_vocab, self.sentinel_token_ids, rng=self._rng)
         elif task == "note_denoising":
-            enc_mid, dec_mid = _corruption.note_denoising(ids, midi_vocab, sentinel_start_id=sentinel_start, rng=rng)
+            enc_mid, dec_mid, _ = _corruption.note_denoising(
+                midi_ids, midi_vocab, self.sentinel_token_ids, rng=self._rng)
         elif task == "attribute_denoising":
-            enc_mid, dec_mid = _corruption.attribute_denoising(ids, midi_vocab, rng=rng)
+            enc_mid, dec_mid, _ = _corruption.attribute_denoising(
+                midi_ids, midi_vocab, self.sentinel_token_ids, rng=self._rng)
         elif task == "heavy_denoising":
-            enc_mid, dec_mid = _corruption.heavy_denoising(ids, midi_vocab, sentinel_start_id=sentinel_start, rng=rng)
+            enc_mid, dec_mid, _ = _corruption.heavy_denoising(
+                midi_ids, midi_vocab, self.sentinel_token_ids, rng=self._rng)
         elif task == "continuation":
-            enc_mid, dec_mid = _corruption.continuation(ids, midi_vocab, rng=rng)
+            enc_mid, dec_mid, _ = _corruption.continuation(
+                midi_ids, midi_vocab, self.sentinel_token_ids, rng=self._rng)
+        elif task == "no_corruption":
+            enc_mid, dec_mid = list(midi_ids), list(midi_ids)
         else:
-            # Default to no corruption: full reconstruction
-            enc_mid, dec_mid = list(ids), list(ids)
+            enc_mid, dec_mid = list(midi_ids), list(midi_ids)
 
-        # Offset MIDI IDs into the global vocabulary range
-        enc_mid_global = [self._midi_id_to_global(int(t)) if int(t) < self.midi_id_offset else int(t) for t in enc_mid]
-        dec_mid_global = [self._midi_id_to_global(int(t)) if int(t) < self.midi_id_offset else int(t) for t in dec_mid]
+        # Offset MIDI IDs into global vocab range
+        enc_mid_global = [
+            self._midi_id_to_global(int(t)) if int(t) < self.midi_id_offset else int(t)
+            for t in enc_mid
+        ]
+        dec_mid_global = [
+            self._midi_id_to_global(int(t)) if int(t) < self.midi_id_offset else int(t)
+            for t in dec_mid
+        ]
 
-        # Format prompt
+        # 7. Build prompt
+        meta_str = self._format_metadata(metadata, task, segment, midi_ids, midi_vocab)
         templates = MIDI_TASK_PROMPTS.get(task, MIDI_TASK_PROMPTS["note_denoising"])
-        template = self._py_random.choice(templates)
-        meta_str = self._format_metadata(metadata)
-        prompt = template.format(metadata=meta_str)
+        template = self._pick_continuation_template(task, templates, segment, midi_ids, midi_vocab)
+        prompt = self._format_prompt(template, meta_str, segment, midi_ids, midi_vocab, enc_mid, dec_mid)
+
+        # 8. Encode prompt text
         if hasattr(self.text_tokenizer, "encode"):
             text_ids = list(self.text_tokenizer.encode(prompt))
         else:
             text_ids = []
 
-        encoder_ids = list(text_ids) + enc_mid_global
-        decoder_ids = dec_mid_global
-        return encoder_ids, decoder_ids
+        # 9. Build encoder: [text_prompt_ids] + [format_sentinel] + [corrupted_midi_ids]
+        encoder_ids: list[int] = list(text_ids)
+        if format_sentinel_id is not None:
+            encoder_ids.append(format_sentinel_id)
+        encoder_ids.extend(enc_mid_global)
+
+        # 10. Build decoder: [decoder_midi_ids]
+        decoder_ids: list[int] = list(dec_mid_global)
+
+        # Truncate to max_seq_len
+        max_len = self.config.max_seq_len
+        if len(encoder_ids) > max_len:
+            encoder_ids = encoder_ids[:max_len]
+        if len(decoder_ids) > max_len:
+            decoder_ids = decoder_ids[:max_len]
+
+        # Pad both to same length (max_seq_len)
+        pad = self.config.pad_token_id
+        ignore = self.config.label_ignore_id
+
+        enc_arr = np.full(max_len, pad, dtype=np.int32)
+        enc_arr[:len(encoder_ids)] = encoder_ids
+
+        dec_arr = np.full(max_len, pad, dtype=np.int32)
+        dec_arr[:len(decoder_ids)] = decoder_ids
+
+        labels = np.full(max_len, ignore, dtype=np.int32)
+        labels[:len(decoder_ids)] = decoder_ids
+
+        attn_mask = np.zeros(max_len, dtype=np.int32)
+        attn_mask[:len(encoder_ids)] = 1
+
+        dec_attn_mask = np.zeros(max_len, dtype=np.int32)
+        dec_attn_mask[:len(decoder_ids)] = 1
+
+        return {
+            "input_ids": enc_arr,
+            "decoder_input_ids": dec_arr,
+            "labels": labels,
+            "attention_mask": attn_mask,
+            "decoder_attention_mask": dec_attn_mask,
+        }
+
+    def _midi_id_to_global(self, mid_id: int) -> int:
+        return mid_id + self.midi_id_offset
+
+    def _pick_continuation_template(
+        self,
+        task: str,
+        templates: list[str],
+        segment: dict[str, Any],
+        midi_ids: list[int],
+        midi_vocab: dict[str, int],
+    ) -> str:
+        """Pick an appropriate template, choosing continuation variants wisely."""
+        if task != "continuation":
+            return self._py_random.choice(templates)
+
+        # For continuation, choose between measure-based, beat-based, and "complete" templates
+        # "Complete" only if the piece is short enough
+        n = len(midi_ids)
+        max_len = self.config.max_seq_len
+        if n <= max_len * 0.8:
+            # Piece fits — all templates valid
+            return self._py_random.choice(templates)
+        else:
+            # Exclude "Complete this piece" template
+            filtered = [t for t in templates if "Complete this piece" not in t]
+            return self._py_random.choice(filtered) if filtered else templates[0]
+
+    def _format_prompt(
+        self,
+        template: str,
+        meta_str: str,
+        segment: dict[str, Any],
+        midi_ids: list[int],
+        midi_vocab: dict[str, int],
+        enc_ids: list[int],
+        dec_ids: list[int],
+    ) -> str:
+        """Format a prompt template, filling in all placeholders."""
+        structure = analyze_midi_structure(midi_ids, midi_vocab)
+        bars = structure["bar_indices"]
+        beats = structure["beat_indices"] or structure["timing_indices"]
+
+        # Count prefix/continuation measures and beats
+        prefix_len = len(enc_ids)
+        prefix_bars = sum(1 for b in bars if b < prefix_len)
+        total_bars = len(bars)
+        continuation_bars = max(1, total_bars - prefix_bars)
+
+        prefix_beats = sum(1 for b in beats if b < prefix_len)
+        total_beats = len(beats)
+        continuation_beats = max(1, total_beats - prefix_beats)
+
+        return template.format(
+            metadata=meta_str,
+            prefix_measures=prefix_bars,
+            continuation_measures=continuation_bars,
+            prefix_beats=prefix_beats,
+            continuation_beats=continuation_beats,
+        )
 
     @staticmethod
-    def _format_metadata(metadata: dict | None) -> str:
+    def _format_metadata(
+        metadata: dict | None,
+        task: str | None = None,
+        segment: dict | None = None,
+        midi_ids: list[int] | None = None,
+        midi_vocab: dict | None = None,
+    ) -> str:
         if not metadata:
             return "an unknown piece"
         parts = []
@@ -343,121 +453,42 @@ class Mid2MidCollator:
             return "an unknown piece"
         return " ".join(parts)
 
-    def __call__(
-        self,
-        midi_paths: list[Path],
-        metadata: list[dict] | None = None,
-    ) -> dict[str, np.ndarray]:
-        """Collate a batch of MIDI files into training examples.
+    # ------------------------------------------------------------------
+    # Batch collation
+    # ------------------------------------------------------------------
 
-        For each MIDI file:
-        1. Parse with midi_tokenizer into token IDs
-        2. Sample a corruption task type from config.task_weights
-        3. Apply the corresponding corruption strategy
-        4. Sample a natural language prompt template for that task type
-        5. Format the prompt with score metadata
-        6. Encode: [text_prompt_tokens] + [corrupted_midi_tokens]
-        7. Decode: [original_midi_tokens] (or continuation segment)
+    def __call__(self, segments: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+        """Collate a list of segment dicts into a batch.
 
-        Args:
-            midi_paths: paths to .mid files
-            metadata: optional per-file metadata dicts with keys like
-                "composer", "title", "key", "time_signature", "era"
-
-        Returns dict of NumPy int32 arrays of shape ``(batch, max_seq_len)``.
+        Returns dict of NumPy int32 arrays of shape ``(batch_size, max_seq_len)``.
         """
         max_len = self.config.max_seq_len
-        examples: list[tuple[list[int], list[int]]] = []
-        for i, p in enumerate(midi_paths):
-            md = metadata[i] if metadata is not None and i < len(metadata) else None
-            res = self._process_single(Path(p), md)
-            if res is None:
-                continue
-            enc, dec = res
-            # truncate per example so packing can fit
-            if len(enc) > max_len:
-                enc = enc[:max_len]
-            if len(dec) > max_len:
-                dec = dec[:max_len]
-            examples.append((enc, dec))
+        examples: list[dict[str, np.ndarray]] = []
+
+        for seg in segments:
+            result = self._process_segment(seg)
+            if result is not None:
+                examples.append(result)
 
         if not examples:
             empty = np.zeros((1, max_len), dtype=np.int32)
+            ignore_labels = np.full((1, max_len), self.config.label_ignore_id, dtype=np.int32)
             return {
                 "input_ids": empty,
                 "decoder_input_ids": empty.copy(),
-                "labels": empty.copy(),
-                "segment_ids": empty.copy(),
-                "position_ids": empty.copy(),
-                "decoder_segment_ids": empty.copy(),
-                "decoder_position_ids": empty.copy(),
+                "labels": ignore_labels,
+                "attention_mask": empty.copy(),
+                "decoder_attention_mask": empty.copy(),
             }
 
-        if self.config.pack_sequences:
-            packed_enc: list[list[int]] = [[]]
-            packed_dec: list[list[int]] = [[]]
-            packed_eseg: list[list[int]] = [[]]
-            packed_dseg: list[list[int]] = [[]]
-            packed_epos: list[list[int]] = [[]]
-            packed_dpos: list[list[int]] = [[]]
-            seg_idx = 1
-            for enc, dec in examples:
-                # Decide whether to start a new pack: enforce that BOTH enc and
-                # dec fit within max_len after appending.
-                cur_enc_len = len(packed_enc[-1])
-                cur_dec_len = len(packed_dec[-1])
-                if cur_enc_len + len(enc) > max_len or cur_dec_len + len(dec) > max_len:
-                    if cur_enc_len == 0 and cur_dec_len == 0:
-                        # Empty pack — accept this oversized example by truncation
-                        enc = enc[:max_len]
-                        dec = dec[:max_len]
-                    else:
-                        packed_enc.append([])
-                        packed_dec.append([])
-                        packed_eseg.append([])
-                        packed_dseg.append([])
-                        packed_epos.append([])
-                        packed_dpos.append([])
-                        seg_idx = 1
-                packed_enc[-1].extend(enc)
-                packed_dec[-1].extend(dec)
-                packed_eseg[-1].extend([seg_idx] * len(enc))
-                packed_dseg[-1].extend([seg_idx] * len(dec))
-                packed_epos[-1].extend(range(1, len(enc) + 1))
-                packed_dpos[-1].extend(range(1, len(dec) + 1))
-                seg_idx += 1
-        else:
-            packed_enc = [list(e) for e, _ in examples]
-            packed_dec = [list(d) for _, d in examples]
-            packed_eseg = [[1] * len(e) for e in packed_enc]
-            packed_dseg = [[1] * len(d) for d in packed_dec]
-            packed_epos = [list(range(1, len(e) + 1)) for e in packed_enc]
-            packed_dpos = [list(range(1, len(d) + 1)) for d in packed_dec]
-
-        batch = len(packed_enc)
-        pad = self.config.pad_token_id
-
-        def _pad(rows: list[list[int]], fill: int = pad) -> np.ndarray:
-            arr = np.full((batch, max_len), fill, dtype=np.int32)
-            for i, row in enumerate(rows):
-                row = row[:max_len]
-                arr[i, : len(row)] = row
-            return arr
-
-        input_ids = _pad(packed_enc)
-        decoder_input_ids = _pad(packed_dec)
-        segment_ids = _pad(packed_eseg, fill=0)
-        position_ids = _pad(packed_epos, fill=0)
-        decoder_segment_ids = _pad(packed_dseg, fill=0)
-        decoder_position_ids = _pad(packed_dpos, fill=0)
-        labels = decoder_input_ids.copy()
-
+        batch_size = len(examples)
         return {
-            "input_ids": input_ids,
-            "decoder_input_ids": decoder_input_ids,
-            "labels": labels,
-            "segment_ids": segment_ids,
-            "position_ids": position_ids,
-            "decoder_segment_ids": decoder_segment_ids,
-            "decoder_position_ids": decoder_position_ids,
+            key: np.stack([ex[key] for ex in examples], axis=0)
+            for key in (
+                "input_ids",
+                "decoder_input_ids",
+                "labels",
+                "attention_mask",
+                "decoder_attention_mask",
+            )
         }

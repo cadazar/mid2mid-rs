@@ -876,6 +876,34 @@ class AdapterScore:
             and list(self._time_signatures) == list(other._time_signatures)
         )
 
+    def shift_time(self, offset: int) -> "AdapterScore":
+        """Return a copy with all event times shifted by ``offset``.
+
+        Negative offsets move events earlier; times are clamped to >= 0.
+        """
+        new = self.copy()
+        for tr in new._tracks:
+            for n in tr.notes:
+                n.time = max(0, n.time + offset)
+            for c in tr.controls:
+                c.time = max(0, c.time + offset)
+            for pb in tr.pitch_bends:
+                pb.time = max(0, pb.time + offset)
+            for p in tr.pedals:
+                p.time = max(0, p.time + offset)
+        new._tempos = TempoList(
+            AdapterTempo(max(0, t.time + offset), t.tempo) for t in new._tempos
+        )
+        new._time_signatures = TimeSignatureList(
+            AdapterTimeSignature(max(0, t.time + offset), t.numerator, t.denominator)
+            for t in new._time_signatures
+        )
+        new._key_signatures = KeySignatureList(
+            AdapterKeySignature(max(0, k.time + offset), k.key, k.tonality)
+            for k in new._key_signatures
+        )
+        return new
+
     # -- resampling -------------------------------------------------------
     def resample(self, new_tpq: int, min_dur: int = 1) -> "AdapterScore":
         old_tpq = self.ticks_per_quarter
