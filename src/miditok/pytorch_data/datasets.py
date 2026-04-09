@@ -8,7 +8,7 @@ from functools import partial
 from os import cpu_count
 from typing import TYPE_CHECKING, Any
 
-from symusic import Score
+from miditok.midi_adapter import AdapterScore as Score
 from torch import LongTensor
 from torch.utils.data import Dataset
 from tqdm import tqdm

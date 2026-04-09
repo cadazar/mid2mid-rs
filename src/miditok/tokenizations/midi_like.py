@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from symusic import Note, Pedal, PitchBend, Score, Tempo, TimeSignature, Track
+from miditok.midi_adapter import (
+    AdapterNote as Note,
+    AdapterPedal as Pedal,
+    AdapterPitchBend as PitchBend,
+    AdapterScore as Score,
+    AdapterTempo as Tempo,
+    AdapterTimeSignature as TimeSignature,
+    AdapterTrack as Track,
+)
 
 from miditok.classes import Event, TokSequence
 from miditok.constants import DEFAULT_VELOCITY, MIDI_INSTRUMENTS, TIME_SIGNATURE

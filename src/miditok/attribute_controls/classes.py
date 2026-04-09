@@ -13,8 +13,8 @@ from miditok.utils import get_bars_ticks
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from symusic import Score
-    from symusic.core import TrackTick
+    from miditok.midi_adapter import AdapterScore as Score
+    from miditok.midi_adapter import AdapterTrack as TrackTick
 
     from miditok import Event
 

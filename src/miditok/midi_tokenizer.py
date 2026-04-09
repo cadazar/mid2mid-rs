@@ -14,38 +14,29 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
-from huggingface_hub import ModelHubMixin as HFHubMixin
-from huggingface_hub import hf_hub_download
-from symusic import (
-    ControlChange,
-    Note,
-    Pedal,
-    PitchBend,
-    Score,
-    Tempo,
-    TimeSignature,
-    Track,
-)
-from symusic.core import (
-    NoteTickList,
-    PedalTickList,
-    PitchBendTickList,
-    ScoreTick,
-    TimeSignatureTickList,
-)
 from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
 
-try:
-    from miditoolkit import MidiFile
-except ImportError:
-    MidiFile = None
-from tokenizers import AddedToken
-from tokenizers import Tokenizer as _HFTokenizer
-from tokenizers import decoders as _decoders
-from tokenizers import models as _tok_models
-from tokenizers import pre_tokenizers as _pre_tokenizers
-from tokenizers import trainers as _tok_trainers
+from .midi_adapter import (
+    AdapterControlChange as ControlChange,
+    AdapterNote as Note,
+    AdapterPedal as Pedal,
+    AdapterPitchBend as PitchBend,
+    AdapterScore as Score,
+    AdapterTempo as Tempo,
+    AdapterTimeSignature as TimeSignature,
+    AdapterTrack as Track,
+    NoteList as NoteTickList,
+    PedalList as PedalTickList,
+    PitchBendList as PitchBendTickList,
+    TempoList as TempoTickList,
+    TimeSignatureList as TimeSignatureTickList,
+)
+
+# ScoreTick used only for isinstance checks; alias to AdapterScore
+ScoreTick = Score
+MidiFile = None  # miditoolkit dependency removed
+_HFTokenizer = None  # tokenizers dependency removed
 
 from .attribute_controls import (
     BarAttributeControl,
@@ -65,8 +56,6 @@ from .constants import (
     CHR_ID_START,
     CPU_COUNT_ADDED_WORKERS,
     CURRENT_MIDITOK_VERSION,
-    CURRENT_SYMUSIC_VERSION,
-    CURRENT_TOKENIZERS_VERSION,
     DEFAULT_TOKENIZER_FILE_NAME,
     DEFAULT_TRAINING_MODEL_NAME,
     EOS_TOKEN_NAME,
@@ -100,18 +89,15 @@ from .utils import (
 from .utils.utils import (
     add_bar_beats_ticks_to_tokseq,
     get_deepest_common_subdir,
-    miditoolkit_to_symusic,
     np_get_closest,
     tempo_qpm_to_mspq,
 )
 
 if TYPE_CHECKING:
-    from symusic.core import TempoTickList
-
     from .attribute_controls import AttributeControl
 
 
-class MusicTokenizer(ABC, HFHubMixin):
+class MusicTokenizer(ABC):
     r"""
     Base music tokenizer class, acting as a common framework.
 
@@ -2675,7 +2661,7 @@ class MusicTokenizer(ABC, HFHubMixin):
     def train(
         self,
         vocab_size: int,
-        model: Literal["BPE", "Unigram", "WordPiece"] | _tok_models.Model | None = None,
+        model: Literal["BPE", "Unigram", "WordPiece"] | None = None,
         iterator: Iterable | None = None,
         files_paths: Sequence[Path] | None = None,
         **kwargs,
@@ -2736,10 +2722,13 @@ class MusicTokenizer(ABC, HFHubMixin):
             the model for training. It musts implement the ``__len__`` method. If
             None is given, you must use the ``tokens_paths`` argument. (default: None)
         :param files_paths: paths of the music files to load and use. (default: None)
-        :param kwargs: any additional argument to pass to the trainer or model. See the
-            `tokenizers docs <https://huggingface.co/docs/tokenizers/api/trainers>`_
-            for more details.
+        :param kwargs: any additional argument to pass to the trainer or model.
         """
+        msg = "BPE training requires the 'tokenizers' package"
+        raise NotImplementedError(msg)
+
+    def _train_disabled(self) -> None:
+        # Original training body removed; logic preserved below in dead code path.
         # Checks the arguments/config are compatible for training
         if self.is_multi_voc:
             warnings.warn(
@@ -3434,43 +3423,22 @@ class MusicTokenizer(ABC, HFHubMixin):
         self,
         save_directory: str | Path,
         *,
-        repo_id: str | None = None,
-        push_to_hub: bool = False,
-        **push_to_hub_kwargs,
+        repo_id: str | None = None,  # noqa: ARG002
+        push_to_hub: bool = False,  # noqa: ARG002
+        **push_to_hub_kwargs,  # noqa: ARG002
     ) -> str | None:
-        """
-        Save the tokenizer in local a directory.
+        """Save the tokenizer locally as JSON.
 
-        Overridden from ``huggingface_hub.ModelHubMixin``.
-        Since v0.21 this method will automatically save ``self.config`` on after
-        calling ``self._save_pretrained``, which is unnecessary in our case.
-
-        :param save_directory: Path to directory in which the model weights and
-            configuration will be saved.
-        :param push_to_hub: Whether to push your model to the Huggingface Hub after
-            saving it.
-        :param repo_id: ID of your repository on the Hub. Used only if
-            `push_to_hub=True`. Will default to the folder name if not provided.
-        :param push_to_hub_kwargs: Additional key word arguments passed along to the
-            [`~ModelHubMixin.push_to_hub`] method.
+        ``push_to_hub`` is no longer supported and is ignored.
         """
         save_directory = Path(save_directory)
         save_directory.mkdir(parents=True, exist_ok=True)
-
-        # save model weights/files (framework-specific)
-        self._save_pretrained(save_directory)
-
-        # push to the Hub if required
-        if push_to_hub:
-            kwargs = push_to_hub_kwargs.copy()  # soft-copy to avoid mutating input
-            if repo_id is None:
-                repo_id = save_directory.name  # Defaults to `save_directory` name
-            return self.push_to_hub(repo_id=repo_id, **kwargs)
+        self.save(save_directory)
         return None
 
-    def _save_pretrained(self, *args, **kwargs) -> None:  # noqa: ANN002
-        # called by `ModelHubMixin.from_pretrained`.
-        self.save(*args, **kwargs)
+    def push_to_hub(self, *args, **kwargs) -> None:  # noqa: ARG002, ANN002
+        msg = "push_to_hub is no longer supported"
+        raise NotImplementedError(msg)
 
     def save_params(self, *args, **kwargs) -> None:  # noqa: ANN002
         """
@@ -3492,13 +3460,7 @@ class MusicTokenizer(ABC, HFHubMixin):
             "config": self.config.to_dict(serialize=True),
             "tokenization": self.__class__.__name__,
             "miditok_version": CURRENT_MIDITOK_VERSION,
-            "symusic_version": CURRENT_SYMUSIC_VERSION,
-            "hf_tokenizers_version": CURRENT_TOKENIZERS_VERSION,
         }
-        if self.is_trained:  # saves whole vocab if trained
-            params["_vocab_base"] = self._vocab_base
-            params["_model"] = self._model.to_str()
-            params["_vocab_base_byte_to_token"] = self._vocab_base_byte_to_token
         return params
 
     def save(
@@ -3534,57 +3496,35 @@ class MusicTokenizer(ABC, HFHubMixin):
             json.dump(tokenizer_dict, outfile, indent=4)
 
     @classmethod
-    def _from_pretrained(
+    def from_pretrained(
         cls,
-        *,
-        model_id: str,
-        revision: str | None,
-        cache_dir: str | Path | None,
-        force_download: bool,
-        proxies: dict | None,
-        resume_download: bool,
-        local_files_only: bool,
-        token: str | bool | None,
-        **kwargs,
+        model_id: str | Path,
+        **kwargs,  # noqa: ARG003
     ) -> MusicTokenizer:
-        # Called by `ModelHubMixin.from_pretrained`
+        """Load a tokenizer from a local JSON file or directory."""
         pretrained_path = Path(model_id)
         if pretrained_path.is_file():
             params_path = pretrained_path
         else:
-            filename = kwargs.get("filename", DEFAULT_TOKENIZER_FILE_NAME)
-            if (pretrained_path / filename).is_file():
-                params_path = pretrained_path / filename
-            else:
-                params_path = hf_hub_download(
-                    repo_id=model_id,
-                    filename=filename,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    proxies=proxies,
-                    resume_download=resume_download,
-                    local_files_only=local_files_only,
-                    token=token,
-                    library_name="MidiTok",
-                    library_version=CURRENT_MIDITOK_VERSION,
-                )
+            filename = DEFAULT_TOKENIZER_FILE_NAME
+            params_path = pretrained_path / filename
+            if not params_path.is_file():
+                msg = f"Tokenizer file not found at {params_path}"
+                raise FileNotFoundError(msg)
 
-        # Checking config file tokenization
         with Path(params_path).open() as file:
             tokenization = json.load(file)["tokenization"]
         cls_name = cls.__name__
-        if cls_name not in ["MusicTokenizer", tokenization]:
-            warnings.warn(
-                ".from_pretrained called with an invalid class name. The current class"
-                f"is {cls_name} whereas the config file comes from a {tokenization} "
-                f"tokenizer. Returning an instance of {tokenization}.",
-                stacklevel=2,
-            )
-
-        if cls_name == tokenization:
-            return cls(params=params_path)
-
+        if cls_name == tokenization or cls_name == "MusicTokenizer":
+            if cls_name == tokenization:
+                return cls(params=params_path)
+            miditok_module = sys.modules[".".join(__name__.split(".")[:-1])]
+            return getattr(miditok_module, tokenization)(params=params_path)
+        warnings.warn(
+            f"from_pretrained: class name mismatch ({cls_name} vs {tokenization}); "
+            f"returning a {tokenization} instance.",
+            stacklevel=2,
+        )
         miditok_module = sys.modules[".".join(__name__.split(".")[:-1])]
         return getattr(miditok_module, tokenization)(params=params_path)
 
@@ -3621,8 +3561,7 @@ class MusicTokenizer(ABC, HFHubMixin):
                 self.__vocab_base_inv = {v: k for k, v in value.items()}
                 continue
             if key == "_model":
-                # using 🤗tokenizers builtin method
-                self._model = _HFTokenizer.from_str(value)
+                # BPE/HF tokenizer model loading is no longer supported.
                 continue
             if key == "_vocab_base_byte_to_token":
                 self._vocab_base_byte_to_token = value
@@ -3630,7 +3569,6 @@ class MusicTokenizer(ABC, HFHubMixin):
                 self._vocab_base_id_to_byte = {
                     i: token_to_byte[tok] for tok, i in self._vocab_base.items()
                 }
-                self.__create_vocab_learned_bytes_to_tokens()
                 continue
             if key == "config":
                 if "chord_maps" in value:
@@ -3737,16 +3675,6 @@ class MusicTokenizer(ABC, HFHubMixin):
                 return self.decode(tokens["ids"], *args, **kwargs)
             # music file
             return self.encode(obj, *args, **kwargs)
-
-        # Depreciated miditoolkit object
-        if MidiFile is not None and isinstance(obj, MidiFile):
-            warnings.warn(
-                "You are using a depreciated `miditoolkit.MidiFile` object. MidiTok"
-                "is now (>v3.0.0) using symusic.Score as MIDI backend. Your file will"
-                "be converted on the fly, however please consider using symusic.",
-                stacklevel=2,
-            )
-            return self.encode(miditoolkit_to_symusic(obj), *args, **kwargs)
 
         # Decode tokens, may be a TokSequence, numpy array or tensor
         return self.decode(obj, *args, **kwargs)

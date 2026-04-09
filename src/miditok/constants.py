@@ -1,10 +1,11 @@
 """Constants for data encoding."""
 
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
-CURRENT_MIDITOK_VERSION = version("miditok")
-CURRENT_TOKENIZERS_VERSION = version("tokenizers")
-CURRENT_SYMUSIC_VERSION = version("symusic")
+try:
+    CURRENT_MIDITOK_VERSION = version("miditok")
+except PackageNotFoundError:
+    CURRENT_MIDITOK_VERSION = "0.0.0"
 
 MIDI_FILES_EXTENSIONS = {".mid", ".midi", ".MID", ".MIDI"}
 ABC_FILES_EXTENSIONS = {".abc", ".ABC"}

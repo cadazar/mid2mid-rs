@@ -72,8 +72,6 @@ if TYPE_CHECKING:
 
 IGNORED_CONFIG_KEY_DICT = [
     "miditok_version",
-    "symusic_version",
-    "hf_tokenizers_version",
 ]
 
 

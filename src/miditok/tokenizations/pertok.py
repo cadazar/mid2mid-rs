@@ -5,7 +5,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from symusic import Note, Pedal, PitchBend, Score, Tempo, TimeSignature, Track
+from miditok.midi_adapter import (
+    AdapterNote as Note,
+    AdapterPedal as Pedal,
+    AdapterPitchBend as PitchBend,
+    AdapterScore as Score,
+    AdapterTempo as Tempo,
+    AdapterTimeSignature as TimeSignature,
+    AdapterTrack as Track,
+)
 
 from miditok.classes import Event, TokenizerConfig, TokSequence
 from miditok.constants import DEFAULT_VELOCITY, MIDI_INSTRUMENTS, TIME_SIGNATURE
@@ -15,7 +23,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from numpy.typing import NDArray
-    from symusic.core import TimeSignatureTickList
+    from miditok.midi_adapter import TimeSignatureList as TimeSignatureTickList
 
 
 class PerTok(MusicTokenizer):

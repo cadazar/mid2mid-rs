@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from pathlib import Path
 
-    from symusic import Score
+    from miditok.midi_adapter import AdapterScore as Score
 
     from miditok import TokenizerConfig
 

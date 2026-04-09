@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from symusic import Score
+from .midi_adapter import AdapterScore as Score
 
 from .attribute_controls import create_random_ac_indexes
 from .classes import TokSequence

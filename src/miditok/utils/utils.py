@@ -9,18 +9,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-from symusic import (
-    ControlChange,
-    Note,
-    Pedal,
-    PitchBend,
-    Score,
-    Tempo,
-    TextMeta,
-    TimeSignature,
-    Track,
+from miditok.midi_adapter import (
+    AdapterControlChange as ControlChange,
+    AdapterNote as Note,
+    AdapterPedal as Pedal,
+    AdapterPitchBend as PitchBend,
+    AdapterScore as Score,
+    AdapterTempo as Tempo,
+    AdapterTimeSignature as TimeSignature,
+    AdapterTrack as Track,
+    NoteList as NoteTickList,
 )
-from symusic.core import NoteTickList
+
+# TextMeta is not used by the core encode/decode pipeline; keep a placeholder.
+TextMeta = None
 
 from miditok.classes import Event, TokSequence
 from miditok.constants import (
@@ -36,8 +38,8 @@ from miditok.constants import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from miditoolkit import MidiFile
-    from symusic.core import TrackTickList
+    MidiFile = None  # type: ignore[assignment]
+    TrackTickList = list  # type: ignore[assignment,misc]
 
 
 def convert_ids_tensors_to_list(ids) -> list[int] | list[list[int]]:  # noqa: ANN001
@@ -595,59 +597,10 @@ def tempo_qpm_to_mspq(tempo_qpm: int | float | np.ndarray) -> int | float | np.n
     return 60000000 / tempo_qpm
 
 
-def miditoolkit_to_symusic(midi: MidiFile) -> Score:
-    """
-    Convert a ``miditoolkit.MidiFile`` object into a ``symusic.Score``.
-
-    :param midi: ``miditoolkit.MidiFile`` object to convert.
-    :return: the `symusic.Score`` equivalent.
-    """
-    score = Score(midi.ticks_per_beat)
-
-    # MIDI events (except key signature)
-    for time_sig in midi.time_signature_changes:
-        score.time_signatures.append(
-            TimeSignature(time_sig.time, time_sig.numerator, time_sig.denominator)
-        )
-    for tempo in midi.tempo_changes:
-        score.tempos.append(Tempo(tempo.time, tempo.tempo))
-    for marker in midi.markers:
-        score.markers.append(TextMeta(marker.time, marker.text))
-
-    # Track events
-    for inst in midi.instruments:
-        track = Track(
-            name=inst.name,
-            program=inst.program,
-            is_drum=inst.is_drum,
-        )
-        for note in inst.notes:
-            track.notes.append(
-                Note(note.start, note.duration, note.pitch, note.velocity)
-            )
-        track.notes.sort(key=lambda x: (x.start, x.pitch, x.end, x.velocity))
-
-        for control in inst.control_changes:
-            track.controls.append(
-                ControlChange(control.time, control.number, control.value)
-            )
-        track.controls.sort()
-
-        for pb in inst.pitch_bends:
-            track.pitch_bends.append(PitchBend(pb.time, pb.pitch))
-        track.pitch_bends.sort()
-
-        for pedal in inst.pedals:
-            track.pedals.append(Pedal(pedal.start, pedal.duration))
-        track.pedals.sort()
-
-        score.tracks.append(track)
-
-    if len(score.tracks) > 0 and len(midi.lyrics) > 0:
-        for lyric in midi.lyrics:
-            score.tracks[0].lyrics.append(TextMeta(lyric.time, lyric.text))
-
-    return score
+def miditoolkit_to_symusic(midi):  # noqa: ANN001, ANN201
+    """Stub: ``miditoolkit`` is no longer supported."""
+    msg = "miditoolkit_to_symusic is no longer supported"
+    raise NotImplementedError(msg)
 
 
 def compute_ticks_per_beat(time_sig_denominator: int, time_division: int) -> int:

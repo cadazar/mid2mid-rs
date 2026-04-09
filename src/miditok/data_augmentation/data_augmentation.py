@@ -10,7 +10,7 @@ from pathlib import Path
 from shutil import copy2
 
 import numpy as np
-from symusic import Note, Score
+from miditok.midi_adapter import AdapterNote as Note, AdapterScore as Score
 from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
 

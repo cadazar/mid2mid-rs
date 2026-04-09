@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-from symusic import Note, Score, Track
+from miditok.midi_adapter import (
+    AdapterNote as Note,
+    AdapterScore as Score,
+    AdapterTrack as Track,
+)
 
 from miditok.classes import Event, TokSequence
 from miditok.constants import DEFAULT_VELOCITY, MIDI_INSTRUMENTS

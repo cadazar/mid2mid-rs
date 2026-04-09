@@ -9,8 +9,13 @@ from os import cpu_count
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from symusic import Score, TextMeta, TimeSignature
-from symusic.core import TimeSignatureTickList
+from miditok.midi_adapter import (
+    AdapterScore as Score,
+    AdapterTimeSignature as TimeSignature,
+    TimeSignatureList as TimeSignatureTickList,
+)
+
+TextMeta = None  # not used by core split logic
 from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
 

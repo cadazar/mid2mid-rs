@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from symusic import (
-    Note,
-    Pedal,
-    PitchBend,
-    Score,
-    Tempo,
-    TimeSignature,
-    Track,
+from miditok.midi_adapter import (
+    AdapterNote as Note,
+    AdapterPedal as Pedal,
+    AdapterPitchBend as PitchBend,
+    AdapterScore as Score,
+    AdapterTempo as Tempo,
+    AdapterTimeSignature as TimeSignature,
+    AdapterTrack as Track,
 )
 
 from miditok.classes import Event, TokenizerConfig, TokSequence

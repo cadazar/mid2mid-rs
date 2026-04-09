@@ -13,7 +13,7 @@ from .classes import AttributeControl
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from symusic.core import TrackTick
+    from miditok.midi_adapter import AdapterTrack as TrackTick
 
 
 class TrackOnsetPolyphony(AttributeControl):
